@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
  */
 
 #ifndef _DSI_PANEL_H_
@@ -157,7 +157,6 @@ struct dsi_backlight_config {
 	u32 bl_scale;
 	u32 bl_scale_sv;
 	bool bl_inverted_dbv;
-	u32 bl_dcs_subtype;
 
 	int en_gpio;
 	/* PWM params */
@@ -232,6 +231,12 @@ enum cabc_state {
 	CABC_MV_STATE,
 	CABC_DIS_STATE,
 	CABC_STATE_NUM,
+};
+
+enum dc_state {
+	DC_OFF_STATE = 0,
+	DC_ON_STATE,
+	DC_STATE_NUM,
 };
 
 struct panel_param_val_map {
