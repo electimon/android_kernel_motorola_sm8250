@@ -1706,11 +1706,12 @@ ffs_fs_mount(struct file_system_type *t, int flags,
 		return ERR_PTR(ret);
 
 	ffs = ffs_data_new(dev_name);
-	if (unlikely(!ffs))
-		return ERR_PTR(-ENOMEM);
-
-	if (IS_ERR(ffs))
-		return ERR_PTR(-EBUSY);
+	if (IS_ERR_OR_NULL(ffs)) {
+		if (!ffs)
+			return ERR_PTR(-ENOMEM);
+		else
+			return ERR_PTR((long) ffs);
+	}
 
 	ffs->file_perms = data.perms;
 	ffs->no_disconnect = data.no_disconnect;
