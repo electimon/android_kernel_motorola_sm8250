@@ -1238,7 +1238,6 @@ static void smblib_uusb_removal(struct smb_charger *chg)
 			is_flash_active(chg) ? SDP_CURRENT_UA : SDP_100_MA);
 	vote(chg->usb_icl_votable, SW_QC3_VOTER, false, 0);
 	vote(chg->usb_icl_votable, HVDCP2_ICL_VOTER, false, 0);
-	vote(chg->usb_icl_votable, HVDCP2_12V_ICL_VOTER, false, 0);
 	vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, false, 0);
 	vote(chg->usb_icl_votable, THERMAL_THROTTLE_VOTER, false, 0);
 	vote(chg->limited_irq_disable_votable, CHARGER_TYPE_VOTER,
@@ -2699,8 +2698,6 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 		rc = smblib_force_vbus_voltage(chg, FORCE_5V_BIT);
 		if (rc < 0)
 			pr_err("Failed to force 5V\n");
-
-		vote(chg->usb_icl_votable, HVDCP2_12V_ICL_VOTER, false, 0);
 		break;
 	case POWER_SUPPLY_DP_DM_FORCE_9V:
 		if (chg->qc2_unsupported_voltage == QC2_NON_COMPLIANT_9V) {
@@ -2726,8 +2723,6 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 		rc = smblib_force_vbus_voltage(chg, FORCE_9V_BIT);
 		if (rc < 0)
 			pr_err("Failed to force 9V\n");
-
-		vote(chg->usb_icl_votable, HVDCP2_12V_ICL_VOTER, false, 0);
 		break;
 	case POWER_SUPPLY_DP_DM_FORCE_12V:
 		if (chg->qc2_unsupported_voltage == QC2_NON_COMPLIANT_12V) {
@@ -2744,8 +2739,6 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 		}
 
 		if ((stat & QC_9V_BIT) || (stat & QC_5V_BIT)) {
-			vote(chg->usb_icl_votable, HVDCP2_12V_ICL_VOTER, true,
-					chg->chg_param.hvdcp2_12v_max_icl_ua);
 			/* Force 1A ICL before requesting higher voltage */
 			vote(chg->usb_icl_votable, HVDCP2_ICL_VOTER,
 					true, 1000000);
@@ -3920,19 +3913,18 @@ int smblib_get_prop_typec_power_role(struct smb_charger *chg,
 		return 0;
 	}
 
-	spin_lock(&chg->typec_pr_lock);
 	rc = smblib_read(chg, TYPE_C_MODE_CFG_REG, &ctrl);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't read TYPE_C_MODE_CFG_REG rc=%d\n",
 			rc);
-		goto unlock;
+		return rc;
 	}
 	smblib_dbg(chg, PR_REGISTER, "TYPE_C_MODE_CFG_REG = 0x%02x\n",
 		   ctrl);
 
 	if (ctrl & TYPEC_DISABLE_CMD_BIT) {
 		val->intval = POWER_SUPPLY_TYPEC_PR_NONE;
-		goto unlock;
+		return rc;
 	}
 
 	switch (ctrl & (EN_SRC_ONLY_BIT | EN_SNK_ONLY_BIT)) {
@@ -3949,14 +3941,10 @@ int smblib_get_prop_typec_power_role(struct smb_charger *chg,
 		val->intval = POWER_SUPPLY_TYPEC_PR_NONE;
 		smblib_err(chg, "unsupported power role 0x%02lx\n",
 			ctrl & (EN_SRC_ONLY_BIT | EN_SNK_ONLY_BIT));
-		rc = -EINVAL;
-		goto unlock;
+		return -EINVAL;
 	}
 
 	chg->power_role = val->intval;
-unlock:
-	spin_unlock(&chg->typec_pr_lock);
-
 	return rc;
 }
 
@@ -4596,7 +4584,6 @@ int smblib_set_prop_typec_power_role(struct smb_charger *chg,
 	if (chg->connector_type == POWER_SUPPLY_CONNECTOR_MICRO_USB)
 		return 0;
 
-	spin_lock(&chg->typec_pr_lock);
 	smblib_dbg(chg, PR_MISC, "power role change: %d --> %d!",
 			chg->power_role, val->intval);
 
@@ -4608,7 +4595,7 @@ int smblib_set_prop_typec_power_role(struct smb_charger *chg,
 			chg->power_role != POWER_SUPPLY_TYPEC_PR_NONE) {
 		smblib_dbg(chg, PR_MISC, "power role already in %d, ignore!",
 				chg->power_role);
-		goto unlock;
+		return 0;
 	}
 
 	typec_mode = smblib_get_prop_typec_mode(chg);
@@ -4634,6 +4621,7 @@ int smblib_set_prop_typec_power_role(struct smb_charger *chg,
 	smblib_dbg(chg, PR_MISC, "snk_attached = %d, src_attached = %d, is_pr_lock = %d\n",
 			snk_attached, src_attached, is_pr_lock);
 	cancel_delayed_work(&chg->pr_lock_clear_work);
+	spin_lock(&chg->typec_pr_lock);
 	if (!chg->pr_lock_in_progress && is_pr_lock) {
 		smblib_dbg(chg, PR_MISC, "disable type-c interrupts for power role locking\n");
 		smblib_typec_irq_config(chg, false);
@@ -4645,6 +4633,7 @@ int smblib_set_prop_typec_power_role(struct smb_charger *chg,
 	}
 
 	chg->pr_lock_in_progress = is_pr_lock;
+	spin_unlock(&chg->typec_pr_lock);
 
 	switch (val->intval) {
 	case POWER_SUPPLY_TYPEC_PR_NONE:
@@ -4661,8 +4650,7 @@ int smblib_set_prop_typec_power_role(struct smb_charger *chg,
 		break;
 	default:
 		smblib_err(chg, "power role %d not supported\n", val->intval);
-		rc = -EINVAL;
-		goto unlock;
+		return -EINVAL;
 	}
 
 	rc = smblib_masked_write(chg, TYPE_C_MODE_CFG_REG,
@@ -4671,13 +4659,10 @@ int smblib_set_prop_typec_power_role(struct smb_charger *chg,
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't write 0x%02x to TYPE_C_INTRPT_ENB_SOFTWARE_CTRL rc=%d\n",
 			power_role, rc);
-		goto unlock;
+		return rc;
 	}
 
 	chg->power_role = val->intval;
-unlock:
-	spin_unlock(&chg->typec_pr_lock);
-
 	return rc;
 }
 
@@ -5896,6 +5881,7 @@ static void smblib_handle_hvdcp_check_timeout(struct smb_charger *chg,
 	u32 hvdcp_ua = 0;
 
 	if (rising) {
+
 		if (qc_charger) {
 			hvdcp_ua = (chg->real_charger_type ==
 					POWER_SUPPLY_TYPE_USB_HVDCP) ?
@@ -6640,7 +6626,6 @@ static void typec_src_removal(struct smb_charger *chg)
 	vote(chg->usb_icl_votable, SW_QC3_VOTER, false, 0);
 	vote(chg->usb_icl_votable, CTM_VOTER, false, 0);
 	vote(chg->usb_icl_votable, HVDCP2_ICL_VOTER, false, 0);
-	vote(chg->usb_icl_votable, HVDCP2_12V_ICL_VOTER, false, 0);
 	vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, false, 0);
 	vote(chg->usb_icl_votable, THERMAL_THROTTLE_VOTER, false, 0);
 	if (!chg->moisture_present)
