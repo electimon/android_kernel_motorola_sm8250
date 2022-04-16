@@ -19,7 +19,12 @@
 #include "fts_lib/ftsTool.h"
 #include "fts_lib/ftsError.h"
 #include "fts_lib/ftsSoftware.h"
+#include "fts_lib/ftsGesture.h"
 #include <linux/regulator/consumer.h>
+
+#ifdef TS_MMI_TOUCH_MULTIWAY_UPDATE_FW
+int flash_mode; /* global variable */
+#endif
 
 extern void fts_resume_func(struct fts_ts_info *info);
 extern void fts_suspend_func(struct fts_ts_info *info);
@@ -32,16 +37,49 @@ extern int fts_fw_update(struct fts_ts_info *info);
 
 static ssize_t fts_mmi_calibrate_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size);
-static ssize_t fts_mmi_report_rate_store(struct device *dev,
+static ssize_t fts_mmi_interpolation_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size);
-static ssize_t fts_mmi_report_rate_show(struct device *dev,
+static ssize_t fts_mmi_interpolation_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t fts_mmi_linearity_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size);
+static ssize_t fts_mmi_linearity_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t fts_mmi_first_filter_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size);
+static ssize_t fts_mmi_first_filter_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t fts_mmi_jitter_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size);
+static ssize_t fts_mmi_jitter_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t fts_mmi_edge_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size);
+static ssize_t fts_mmi_edge_show(struct device *dev,
 		struct device_attribute *attr, char *buf);
 
 static DEVICE_ATTR(calibrate, (S_IWUSR | S_IWGRP), NULL, fts_mmi_calibrate_store);
-static DEVICE_ATTR(report_rate, (S_IRUGO | S_IWUSR | S_IWGRP),
-	fts_mmi_report_rate_show, fts_mmi_report_rate_store);
+static DEVICE_ATTR(interpolation, (S_IRUGO | S_IWUSR | S_IWGRP),
+	fts_mmi_interpolation_show, fts_mmi_interpolation_store);
+static DEVICE_ATTR(linearity, (S_IRUGO | S_IWUSR | S_IWGRP),
+	fts_mmi_linearity_show, fts_mmi_linearity_store);
+static DEVICE_ATTR(first_filter, (S_IRUGO | S_IWUSR | S_IWGRP),
+	fts_mmi_first_filter_show, fts_mmi_first_filter_store);
+static DEVICE_ATTR(jitter, (S_IRUGO | S_IWUSR | S_IWGRP),
+	fts_mmi_jitter_show, fts_mmi_jitter_store);
+static DEVICE_ATTR(edge, (S_IRUGO | S_IWUSR | S_IWGRP),
+	fts_mmi_edge_show, fts_mmi_edge_store);
 
 #define MAX_ATTRS_ENTRIES 10
+#define ROTATE_0   0
+#define ROTATE_90   1
+#define ROTATE_180   2
+#define ROTATE_270  3
+#define BIG_MODE   1
+#define DEFAULT_MODE   0
+#define SMALL_EDGE   0
+#define BIG_EDGE   1
+#define CLOSE_EDGE   2
 #define ADD_ATTR(name) { \
 	if (idx < MAX_ATTRS_ENTRIES)  { \
 		dev_info(dev, "%s: [%d] adding %p\n", __func__, idx, &dev_attr_##name.attr); \
@@ -64,12 +102,25 @@ static int fts_mmi_extend_attribute_group(struct device *dev, struct attribute_g
 	int idx = 0;
 
 	ASSERT_PTR(ts);
-	if (ts->board->report_rate_ctrl)
-		ADD_ATTR(report_rate);
+	if (ts->board->interpolation_ctrl)
+		ADD_ATTR(interpolation);
+
+	if (ts->board->jitter_ctrl)
+		ADD_ATTR(jitter);
+
+	if (ts->board->linearity_ctrl)
+		ADD_ATTR(linearity);
+
+	if (ts->board->first_filter_ctrl)
+		ADD_ATTR(first_filter);
+
+	if (ts->board->edge_ctrl)
+		ADD_ATTR(edge);
 
 	if (strncmp(mmi_bl_bootmode(), "mot-factory", strlen("mot-factory")) == 0) {
 		ADD_ATTR(calibrate);
 	}
+
 	if (idx) {
 		ext_attributes[idx] = NULL;
 		*group = &ext_attr_group;
@@ -78,44 +129,61 @@ static int fts_mmi_extend_attribute_group(struct device *dev, struct attribute_g
 
 	return 0;
 }
-/* Configure different reporting rates
- * mode = 0x00, Set report rate 240Hz
- * mode = 0x01, Set report rate 480Hz
- * ...
+/*
+ * To enable/disable interpolation algorithm to modify report rate.
+ * interpolation_cmd[2] == 0x00, Disable interpolation algorithm
+ * interpolation_cmd[2] == 0x01, Enable interpolation algorithm
+ * report_rate_cmd[2] == 0x00, Set report rate 240Hz
+ * report_rate_cmd[2] == 0x01, Set report rate 288Hz
  */
-static int fts_mmi_set_report_rate(struct fts_ts_info *ts, unsigned int mode)
+#define DSI_REFRESH_RATE_144			144
+static void fts_mmi_set_report_rate(struct fts_ts_info *ts)
 {
+	struct fts_hw_platform_data *board;
 	int ret = 0;
 
-	if (mode == 0x00 || mode == 0x01) {
-		ts->board->report_rate_cmd[2] = mode;
-		ret = fts_write(ts->board->report_rate_cmd, ARRAY_SIZE(ts->board->report_rate_cmd));
-			pr_info("len=%d ", ARRAY_SIZE(ts->board->report_rate_cmd));
+	board = ts->board;
+
+	if (board->interpolation_cmd[2] == 0x01 && ts->refresh_rate == DSI_REFRESH_RATE_144)
+		board->report_rate_cmd[2] = 0x01;
+	else
+		board->report_rate_cmd[2] = 0x00;
+
+	if (ts->report_rate == board->report_rate_cmd[2]) {
+		pr_debug("%s: report rate value is same, so not write.\n", __func__);
 	} else {
-		pr_info("The report rate mode=%d is valid.\n", mode);
-		return -EINVAL;
+		ret = fts_write(board->report_rate_cmd, ARRAY_SIZE(board->report_rate_cmd));
+		if (ret == OK) {
+			ts->report_rate = board->report_rate_cmd[2];
+			pr_err("Successfully to write refresh rate %dHz!\n", ts->refresh_rate);
+		} else
+			pr_err("Failed to write refresh rate %dHz!\n", ts->refresh_rate);
 	}
 
-	if (ret == OK) {
-		ts->report_rate = mode;
-		pr_info("Successfully to set report rate mode=%d!\n", ts->report_rate);
-	} else
-		pr_info("Failed to set report rate mode=%d!\n", ts->report_rate);
-
-	return ret;
+	if (ts->interpolation_val == board->interpolation_cmd[2]) {
+		pr_debug("%s: interpolation value is same, so not write.\n", __func__);
+	} else {
+		ret = fts_write(board->interpolation_cmd, ARRAY_SIZE(board->interpolation_cmd));
+		if (ret == OK) {
+			ts->interpolation_val = board->interpolation_cmd[2];
+			pr_info("Successfully to set inpolation = %d!\n", ts->interpolation_val);
+		} else
+			pr_err("Failed to set inpolation = %d!\n", ts->interpolation_val);
+	}
 }
 
-
-static ssize_t fts_mmi_report_rate_store(struct device *dev,
+static ssize_t fts_mmi_interpolation_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size)
 {
 	struct fts_ts_info *ts;
+	struct fts_hw_platform_data *board;
 	int ret = 0;
 	unsigned long mode = 0;
 
 	dev = MMI_DEV_TO_TS_DEV(dev);
 	ts = dev_get_drvdata(dev);
 	ASSERT_PTR(ts);
+	board = ts->board;
 
 	ret = kstrtoul(buf, 0, &mode);
 	if (ret < 0) {
@@ -123,17 +191,13 @@ static ssize_t fts_mmi_report_rate_store(struct device *dev,
 		return -EINVAL;
 	}
 
-	if (ts->report_rate == mode) {
-		pr_info("value is same,so not write.\n");
-		return size;
-	}
-
-	ret = fts_mmi_set_report_rate(ts, mode);
+	board->interpolation_cmd[2] = mode;
+	fts_mmi_set_report_rate(ts);
 
 	return size;
 }
 
-static ssize_t fts_mmi_report_rate_show(struct device *dev,
+static ssize_t fts_mmi_interpolation_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct fts_ts_info *ts;
@@ -142,8 +206,236 @@ static ssize_t fts_mmi_report_rate_show(struct device *dev,
 	ts = dev_get_drvdata(dev);
 	ASSERT_PTR(ts);
 
-	pr_info("report_rate mode=%d.\n", ts->report_rate);
-	return scnprintf(buf, PAGE_SIZE, "0x%02x", ts->report_rate);
+	pr_info("Interpolation mode = %d.\n", ts->interpolation_val);
+	return scnprintf(buf, PAGE_SIZE, "0x%02x", ts->interpolation_val);
+}
+
+static ssize_t fts_mmi_jitter_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct fts_ts_info *ts;
+	struct fts_hw_platform_data *board;
+	int ret = 0;
+	unsigned int args[3] = { 0 };
+
+	dev = MMI_DEV_TO_TS_DEV(dev);
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+	board = ts->board;
+
+	ret = sscanf(buf, "0x%x 0x%x 0x%x", &args[0], &args[1], &args[2]);
+	if (ret < 3)
+		return -EINVAL;
+
+	/* tap x jitter */
+	board->jitter_cmd[2] = (args[0] >> 8) & 0xff;
+	/* tap y jitter */
+	board->jitter_cmd[3] = args[0] & 0xff;
+	/* slow slidding x jitter */
+	board->jitter_cmd[4] = (args[1] >> 8) & 0xff;
+	/* slow slidding y jitter */
+	board->jitter_cmd[5] = args[1] & 0xff;
+	/* fast slidding y jitter */
+	board->jitter_cmd[6] = (args[2] >> 8) & 0xff;
+	/* fsst slidding y jitter */
+	board->jitter_cmd[7] = args[2] & 0xff;
+
+	if (!memcmp(board->jitter_cmd, ts->jitter_val, sizeof(ts->jitter_val))) {
+		pr_debug("value is same,so not write.\n");
+		return size;
+	}
+
+	memcpy(ts->jitter_val, board->jitter_cmd, sizeof(ts->jitter_val));
+	ret = fts_write(board->jitter_cmd, ARRAY_SIZE(board->jitter_cmd));
+	if (ret == OK) {
+		pr_info("Successfully to set jitter mode:\n");
+		pr_info("tap: %02x %02x, slow: %02x %02x, fast: %02x %02x!\n",
+			ts->jitter_val[2], ts->jitter_val[3], ts->jitter_val[4],
+			ts->jitter_val[5], ts->jitter_val[6], ts->jitter_val[7]);
+	} else {
+		pr_info("Failed to set jitter mode:\n");
+		pr_info("tap: %02x %02x, slow: %02x %02x, fast: %02x %02x!\n",
+			ts->jitter_val[2], ts->jitter_val[3], ts->jitter_val[4],
+			ts->jitter_val[5], ts->jitter_val[6], ts->jitter_val[7]);
+	}
+
+	return size;
+}
+
+static ssize_t fts_mmi_jitter_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct fts_ts_info *ts;
+
+	dev = MMI_DEV_TO_TS_DEV(dev);
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+
+	return scnprintf(buf, PAGE_SIZE, "0x%04x 0x%04x 0x%04x",
+		(ts->jitter_val[2] << 8 | ts->jitter_val[3]),
+		(ts->jitter_val[4] << 8 | ts->jitter_val[5]),
+		(ts->jitter_val[6] << 8 | ts->jitter_val[7]));
+}
+
+static ssize_t fts_mmi_linearity_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct fts_ts_info *ts;
+	struct fts_hw_platform_data *board;
+	int ret = 0;
+	unsigned long mode = 0;
+
+	dev = MMI_DEV_TO_TS_DEV(dev);
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+	board = ts->board;
+
+	ret = kstrtoul(buf, 16, &mode);
+	if (ret < 0) {
+		pr_info("Failed to convert value.\n");
+		return -EINVAL;
+	}
+
+	board->linearity_cmd[2] = mode;
+
+	if (!memcmp(board->linearity_cmd, ts->linearity_val, sizeof(ts->linearity_val))) {
+		pr_debug("value is same, so not write.\n");
+		return size;
+	}
+
+	memcpy(ts->linearity_val, board->linearity_cmd, sizeof(ts->linearity_val));
+	ret = fts_write(board->linearity_cmd, ARRAY_SIZE(board->linearity_cmd));
+	if (ret == OK)
+		pr_info("Successfully to %s linearity mode!\n", (!!mode ? "Enable" : "Disable"));
+	else
+		pr_err("Failed to %s linearity mode!\n", (!!mode ? "Enable" : "Disable"));
+
+	return size;
+}
+
+static ssize_t fts_mmi_linearity_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct fts_ts_info *ts;
+
+	dev = MMI_DEV_TO_TS_DEV(dev);
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+
+	pr_info("Linearity mode is %s!\n", (!!ts->linearity_val[2] ? "Enable" : "Disable"));
+	return scnprintf(buf, PAGE_SIZE, "0x%02x", ts->linearity_val[2]);
+};
+
+static ssize_t fts_mmi_first_filter_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct fts_ts_info *ts;
+	struct fts_hw_platform_data *board;
+	int ret = 0;
+	unsigned int args[2] = { 0 };
+
+	dev = MMI_DEV_TO_TS_DEV(dev);
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+	board = ts->board;
+
+	ret = sscanf(buf, "0x%x 0x%x", &args[0], &args[1]);
+	if (ret < 2)
+		return -EINVAL;
+
+	board->first_filter_cmd[2] = args[0];
+	board->first_filter_cmd[3] = args[1];
+
+	if (!memcmp(board->first_filter_cmd, ts->first_filter_val, sizeof(ts->first_filter_val))) {
+		pr_debug("value is same,so not write.\n");
+		return size;
+	}
+
+	memcpy(ts->first_filter_val, board->first_filter_cmd, sizeof(ts->first_filter_val));
+	ret = fts_write(board->first_filter_cmd, ARRAY_SIZE(board->first_filter_cmd));
+	if (ret == OK)
+		pr_info("Successfully to set first_filter mode: %02x %02x!\n",
+			ts->first_filter_val[2], ts->first_filter_val[3]);
+	else
+		pr_info("Failed to set first_filter mode: %02x %02x!\n",
+			ts->first_filter_val[2], ts->first_filter_val[3]);
+
+	return size;
+}
+
+static ssize_t fts_mmi_first_filter_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct fts_ts_info *ts;
+
+	dev = MMI_DEV_TO_TS_DEV(dev);
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+
+	pr_info("finger filter: 1st = %02x, 2nd = %02x.\n",
+		ts->first_filter_val[2], ts->first_filter_val[3]);
+	return scnprintf(buf, PAGE_SIZE, "0x%02x 0x%02x",
+		ts->first_filter_val[2], ts->first_filter_val[3]);
+}
+
+static ssize_t fts_mmi_edge_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct fts_ts_info *ts;
+	struct fts_hw_platform_data *board;
+	int ret = 0;
+	unsigned int args[2] = { 0 };
+
+	dev = MMI_DEV_TO_TS_DEV(dev);
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+	board = ts->board;
+
+	ret = sscanf(buf, "%d %d", &args[0], &args[1]);
+	if (ret < 2)
+		return -EINVAL;
+	/* UI will not update when rotato to 180 degree.*/
+	if(ROTATE_180 == args[1])
+		return size;
+	/* here need set cmd 02 to fw when 270 degree.*/
+	if(ROTATE_270 == args[1])
+		args[1]--;
+	/* Need set default cmd to fw when 0 degree in any mode.*/
+	if(ROTATE_0 == args[1])
+		args[0] = DEFAULT_MODE;
+
+	board->edge_cmd[2] = CLOSE_EDGE * 3 +args[1];
+
+	if(BIG_MODE == args[0]) {
+		board->edge_cmd[2] = BIG_EDGE* 3 +args[1];
+	}
+
+	if (!memcmp(board->edge_cmd, ts->edge_val, sizeof(ts->edge_val))) {
+		pr_debug("value is same,so not write.\n");
+		return size;
+	}
+
+	memcpy(ts->edge_val, board->edge_cmd, sizeof(ts->edge_val));
+	ret = fts_write(board->edge_cmd, ARRAY_SIZE(board->edge_cmd));
+	if (ret == OK)
+		pr_info("Successfully to set edge mode: %02x!\n", ts->edge_val[2]);
+	else
+		pr_info("Failed to set edge mode: %02x!\n", ts->edge_val[2]);
+
+	return size;
+}
+
+static ssize_t fts_mmi_edge_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct fts_ts_info *ts;
+
+	dev = MMI_DEV_TO_TS_DEV(dev);
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+
+	pr_info("edge = %02x\n", ts->board->edge_cmd[2]);
+	return scnprintf(buf, PAGE_SIZE, "0x%02x", ts->board->edge_cmd[2]);
 }
 
 static ssize_t fts_mmi_calibrate_store(struct device *dev,
@@ -189,11 +481,14 @@ static int fts_mmi_get_vendor(struct device *dev, void *cdata) {
 
 static int fts_mmi_get_productinfo(struct device *dev, void *cdata) {
 	struct fts_ts_info *ts = dev_get_drvdata(dev);
+	u8 readData[3];
 	char buffer[64];
 	ssize_t blen = 0;
 	ASSERT_PTR(ts);
-	blen += scnprintf(buffer+blen, sizeof(buffer)-blen, "fts%04x",
-		ts->sysinfo->u16_chip0Id);
+	fts_writeReadU8UX(FTS_CMD_HW_REG_R, ADDR_SIZE_HW_REG,
+			ADDR_DCHIP_ID, readData, 2, DUMMY_FIFO);
+	blen += scnprintf(buffer+blen, sizeof(buffer)-blen, "fts%02x%02x",
+		readData[0], readData[1]);
 	return scnprintf(TO_CHARP(cdata), TS_MMI_MAX_INFO_LEN, "%s", buffer);
 }
 
@@ -256,6 +551,29 @@ static int fts_mmi_get_flashprog(struct device *dev, void *idata)
 	return 0;
 }
 
+#ifdef TS_MMI_TOUCH_MULTIWAY_UPDATE_FW
+static int fts_mmi_get_flash_mode(struct device *dev, void *idata)
+{
+	struct fts_ts_info *ts = dev_get_drvdata(dev);
+
+	ASSERT_PTR(ts);
+	TO_INT(idata) = flash_mode;
+
+	return 0;
+}
+
+static int fts_mmi_flash_mode(struct device *dev, int mode)
+{
+	struct fts_ts_info *ts = dev_get_drvdata(dev);
+
+	ASSERT_PTR(ts);
+
+	flash_mode = mode;
+
+	return 0;
+}
+#endif
+
 static int fts_mmi_drv_irq(struct device *dev, int state)
 {
 	struct fts_ts_info *ts = dev_get_drvdata(dev);
@@ -289,16 +607,22 @@ static int fts_mmi_reset(struct device *dev, int type)
 static int fts_mmi_panel_state(struct device *dev,
 		enum ts_mmi_pm_mode from, enum ts_mmi_pm_mode to)
 {
+	u8 mask[4] = { 0 };
 	struct fts_ts_info *ts = dev_get_drvdata(dev);
 	ASSERT_PTR(ts);
 	dev_dbg(dev, "%s: panel state change: %d->%d\n", __func__, from, to);
 	pr_info("panel state change: %d->%d\n", from, to);
 	switch (to) {
 	case TS_MMI_PM_GESTURE:
+		/* support single tap gesture */
+		fromIDtoMask(GEST_ID_SIGTAP, mask, GESTURE_MASK_SIZE);
+		updateGestureMask(mask, GESTURE_MASK_SIZE, 1);
+		ts->gesture_enabled = 1;
 	case TS_MMI_PM_DEEPSLEEP:
 		fts_suspend_func(ts);
 			break;
 	case TS_MMI_PM_ACTIVE:
+		ts->gesture_enabled = 0;
 			break;
 	default:
 		dev_warn(dev, "invalid panel state %d\n", to);
@@ -333,14 +657,47 @@ static int fts_mmi_pinctrl(struct device *dev, int on)
 static int fts_mmi_post_resume(struct device *dev)
 {
 	struct fts_ts_info *ts = dev_get_drvdata(dev);
+	struct fts_hw_platform_data *board;
+	int ret = 0;
+
 	ASSERT_PTR(ts);
+	board = ts->board;
 	pr_info("enter\n");
 	dev_dbg(dev, "%s\n", __func__);
 	fts_resume_func(ts);
 	pr_info("IRQ is %s\n", fts_is_InterruptEnabled() ? "EN" : "DIS");
+
 	/* restore data */
-	if (ts->board->report_rate_ctrl)
-		fts_mmi_set_report_rate(ts, ts->report_rate);
+	if (ts->board->jitter_ctrl) {
+		ret = fts_write(board->jitter_cmd, ARRAY_SIZE(board->jitter_cmd));
+		if (ret == OK)
+			dev_dbg(dev, "%s: Successfully to restore jitter mode\n", __func__);
+	}
+
+	if (ts->board->linearity_ctrl) {
+		ret = fts_write(board->linearity_cmd, ARRAY_SIZE(board->linearity_cmd));
+		if (ret == OK)
+			dev_dbg(dev, "%s: Successfully to restore linearity mode!\n", __func__);
+	}
+
+	if (ts->board->first_filter_ctrl) {
+		ret = fts_write(board->first_filter_cmd, ARRAY_SIZE(board->first_filter_cmd));
+		if (ret == OK)
+			dev_dbg(dev, "%s: Successfully to restore first_filter mode!\n", __func__);
+	}
+
+	if (ts->board->report_rate_ctrl) {
+		ret = fts_write(board->report_rate_cmd, ARRAY_SIZE(board->report_rate_cmd));
+		if (ret == OK)
+			dev_dbg(dev, "%s: Successfully to restore report rate mode!\n", __func__);
+	}
+
+	if (ts->board->edge_ctrl) {
+		ret = fts_write(board->edge_cmd, ARRAY_SIZE(board->edge_cmd));
+		if (ret == OK)
+			dev_dbg(dev, "%s: Successfully to restore edge mode!\n", __func__);
+	}
+
 	return 0;
 }
 
@@ -364,10 +721,15 @@ static int fts_mmi_fw_update(struct device *dev, char *fwname)
 static int fts_mmi_charger_mode(struct device *dev, int mode)
 {
 	struct fts_ts_info *ts = dev_get_drvdata(dev);
-	int res = OK;
 	int ret = OK;
 	u8 settings[4] = { 0 };
 	ASSERT_PTR(ts);
+
+	if (mode == ts->charger_enabled) {
+		logError(1, "%s %s: Charger mode is already %s.\n",
+			tag, __func__, !!mode ? "Enable" : "Disable");
+		return ret;
+	}
 
 	ts->mode = MODE_NOTHING;	/* initialize the mode to nothing in
 					 * order to be updated depending on the
@@ -379,8 +741,6 @@ static int fts_mmi_charger_mode(struct device *dev, int mode)
 		logError(1, "%s %s: error during setting CHARGER_MODE! ERROR %08X\n",
 			tag, __func__, ret);
 
-	res |= ret;
-
 	if (ret >= OK && ts->charger_enabled == FEAT_ENABLE) {
 		fromIDtoMask(FEAT_SEL_CHARGER, (u8 *)&ts->mode, sizeof(ts->mode));
 		logError(1, "%s %s: CHARGER_MODE Enabled!\n",
@@ -388,19 +748,22 @@ static int fts_mmi_charger_mode(struct device *dev, int mode)
 	} else
 		logError(1, "%s %s: CHARGER_MODE Disabled!\n", tag, __func__);
 
-	/* if some selective scan want to be enabled can be done an or
-	 * of the following options */
-	/* settings[0] = ACTIVE_MULTI_TOUCH | ACTIVE_KEY | ACTIVE_HOVER
-	 * | ACTIVE_PROXIMITY | ACTIVE_FORCE; */
-	settings[0] = 0xFF;	/* enable all the possible scans mode
-				* supported by the config */
-	logError(0, "%s %s: Sense ON!\n", tag, __func__);
-	res |= setScanMode(SCAN_MODE_ACTIVE, settings[0]);
-	ts->mode |= (SCAN_MODE_ACTIVE << 24);
-	MODE_ACTIVE(ts->mode, settings[0]);
+	return ret;
+}
 
-	setSystemResetedUp(0);
-	return res;
+static int fts_mmi_refresh_rate(struct device *dev, int freq)
+{
+	struct fts_ts_info *ts;
+
+	ts = dev_get_drvdata(dev);
+	ASSERT_PTR(ts);
+
+	ts->refresh_rate = freq;
+
+	if (ts->board->interpolation_ctrl)
+		fts_mmi_set_report_rate(ts);
+
+	return 0;
 }
 
 static int fts_mmi_wait4ready(struct device *dev)
@@ -422,15 +785,22 @@ static struct ts_mmi_methods fts_mmi_methods = {
 	.get_drv_irq = fts_mmi_get_drv_irq,
 	.get_poweron = fts_mmi_get_poweron,
 	.get_flashprog = fts_mmi_get_flashprog,
+#ifdef TS_MMI_TOUCH_MULTIWAY_UPDATE_FW
+	.get_flash_mode = fts_mmi_get_flash_mode,
+#endif
 	.get_class_entry_name = fts_mmi_get_class_entry_name,
 	/* SET methods */
 	.reset =  fts_mmi_reset,
 	.drv_irq = fts_mmi_drv_irq,
 	.charger_mode = fts_mmi_charger_mode,
+	.refresh_rate = fts_mmi_refresh_rate,
 	.power = fts_mmi_power,
 	.pinctrl = fts_mmi_pinctrl,
 	.wait_for_ready = fts_mmi_wait4ready,
 	/* Firmware */
+#ifdef TS_MMI_TOUCH_MULTIWAY_UPDATE_FW
+	.flash_mode = fts_mmi_flash_mode,
+#endif
 	.firmware_update = fts_mmi_fw_update,
 	/* vendor specific attribute group */
 	.extend_attribute_group = fts_mmi_extend_attribute_group,
@@ -451,16 +821,12 @@ int fts_mmi_init(struct fts_ts_info *ts, bool enable)
 		ts->imports = &fts_mmi_methods.exports;
 
 		dev_info(ts->dev, "MMI start sensing\n");
-		ret = fts_chip_initialization(ts, SPECIAL_FULL_PANEL_INIT);
-		if (ret)
-			dev_err(ts->dev, "Failed chip init\n");
 		fts_init_sensing(ts);
 		fts_enableInterrupt();
 
-		/* initialize value */
-		/* The report rate defaults to 240Hz */
-		if (ts->board->report_rate_ctrl)
-			ts->report_rate = 0x00;
+		/* Disable interpolation algorithm */
+		if (ts->board->interpolation_ctrl)
+			ts->interpolation_val = 0x00;
 
 	} else
 		ts_mmi_dev_unregister(ts->dev);

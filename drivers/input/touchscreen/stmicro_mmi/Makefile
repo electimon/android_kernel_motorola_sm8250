@@ -1,10 +1,30 @@
-KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
+stmicro_mmi-objs := fts.o fts_proc.o
+stmicro_mmi-objs += fts_lib/ftsCompensation.o
+stmicro_mmi-objs += fts_lib/ftsCore.o
+stmicro_mmi-objs += fts_lib/ftsError.o
+stmicro_mmi-objs += fts_lib/ftsFlash.o
+stmicro_mmi-objs += fts_lib/ftsFrame.o
+stmicro_mmi-objs += fts_lib/ftsGesture.o
+stmicro_mmi-objs += fts_lib/ftsIO.o
+stmicro_mmi-objs += fts_lib/ftsTest.o
+stmicro_mmi-objs += fts_lib/ftsTime.o
+stmicro_mmi-objs += fts_lib/ftsTool.o
 
-all:
-	$(MAKE) -C $(KERNEL_SRC) M=$(shell pwd) modules $(KBUILD_OPTIONS)
+ifneq ($(filter m y,$(CONFIG_DRM_PANEL_NOTIFICATIONS)),)
+    ccflags-y += -DCONFIG_DRM_PANEL_NOTIFICATIONS
+endif
 
-modules_install:
-	$(MAKE) INSTALL_MOD_STRIP=1 -C $(KERNEL_SRC) M=$(shell pwd) modules_install
+ifneq ($(filter m y,$(CONFIG_ST_LIMIT_USE_SUPPLIER)),)
+    ccflags-y += -DCONFIG_ST_LIMIT_USE_SUPPLIER
+endif
 
-clean:
-	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) clean
+ifneq ($(filter m y,$(CONFIG_INPUT_TOUCHSCREEN_MMI)),)
+    ccflags-y += -DCONFIG_INPUT_TOUCHSCREEN_MMI
+    stmicro_mmi-objs += fts_mmi_class.o
+
+	ifneq ($(filter m y, $(CONFIG_TOUCHCLASS_MMI_MULTIWAY_UPDATE_FW)),)
+		ccflags-y += -DTS_MMI_TOUCH_MULTIWAY_UPDATE_FW
+	endif
+endif
+
+obj-$(TOUCHSCREEN_FTS_TS) := stmicro_mmi.o

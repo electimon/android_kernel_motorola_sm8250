@@ -234,8 +234,18 @@ struct fts_hw_platform_data {
 	unsigned int y_max;
 	bool y_flip, x_flip;
 	bool power_on_suspend;
-	u8 report_rate_cmd[10];	/* /< support report rate switching */
+	u8 jitter_cmd[8];	/* /< support report rate switching */
+	bool jitter_ctrl;	/* /< support report rate switching */
+	u8 linearity_cmd[3];	/* /< support report rate switching */
+	bool linearity_ctrl;	/* /< support report rate switching */
+	u8 first_filter_cmd[4];	/* /< support report rate switching */
+	bool first_filter_ctrl;	/* /< support report rate switching */
+	u8 interpolation_cmd[10];	/* /< report rate interpolation command */
+	bool interpolation_ctrl;	/* /< support report rate interpolation */
+	u8 report_rate_cmd[3];	/* /< report rate switching command */
 	bool report_rate_ctrl;	/* /< support report rate switching */
+	u8 edge_cmd[3];	/* /< edge switching command */
+	bool edge_ctrl;	/* /< edge rate switching */
 };
 
 /*
@@ -310,6 +320,7 @@ struct fts_ts_info {
 				 * indicate if active or lpm) */
 	unsigned long touch_id;	/* /< Bitmask for touch id (mapped to input
 				 * slots) */
+	unsigned int touch_count;
 #ifdef STYLUS_MODE
 	unsigned long stylus_id;	/* /< Bitmask for tracking the stylus
 					 * touches (mapped using the touchId) */
@@ -362,7 +373,13 @@ struct fts_ts_info {
 	const char *fw_file;
 	bool force_reflash;
 
+	unsigned int interpolation_val;
 	unsigned int report_rate;
+	unsigned int refresh_rate;
+	u8 jitter_val[8];
+	u8 first_filter_val[4];
+	u8 linearity_val[3];
+	u8 edge_val[3];
 };
 
 
