@@ -729,7 +729,7 @@ static int mmi_chrg_mgr_is_writeable(struct power_supply *psy,
 }
 
 static const struct power_supply_desc mmi_chrg_mgr_psy_desc = {
-	.name = "mmi_chrg_manager",
+	.name = "mmi_chrg_manager_qc3p",
 	.type = POWER_SUPPLY_TYPE_PARALLEL,
 	.properties = mmi_chrg_mgr_props,
 	.num_properties = ARRAY_SIZE(mmi_chrg_mgr_props),
@@ -1262,11 +1262,10 @@ static void mmi_heartbeat_work(struct work_struct *work)
 {
 	struct mmi_charger_manager *chip = container_of(work,
 				struct mmi_charger_manager, heartbeat_work.work);
-	int hb_resch_time = 0, ret = 0, i = 0;
+	int hb_resch_time = 0, ret = 0;
 	char *chrg_rate_string = NULL;
 	char *envp[2];
 	union power_supply_propval val;
-	bool pd_active;
 
 	mmi_chrg_info(chip, "MMI: Heartbeat!\n");
 	/* Have not been resumed so wait another 100 ms */
@@ -1313,50 +1312,33 @@ static void mmi_heartbeat_work(struct work_struct *work)
 		mmi_chrg_err(chip, "Unable to read PD ACTIVE: %d\n", ret);
 		goto schedule_work;
 	}
-	pd_active = val.intval;
 
-	if (!chip->pd_handle) {
-		chip->pd_handle = devm_usbpd_get_by_phandle(chip->dev,
-						    "qcom,usbpd-phandle");
-		if (IS_ERR_OR_NULL(chip->pd_handle)) {
-			mmi_chrg_err(chip, "Error getting the pd phandle %ld\n",
-				PTR_ERR(chip->pd_handle));
-			chip->pd_handle = NULL;
-			goto schedule_work;
-		}
+	ret = power_supply_get_property(chip->usb_psy,
+				POWER_SUPPLY_PROP_REAL_TYPE, &val);
+	if (ret ) {
+		mmi_chrg_err(chip, "Unable to read real type return: %d\n", ret);
+		goto schedule_work;
 	}
 
-	if (!chip->sm_work_running && chip->vbus_present
-		&& pd_active) {
-		usbpd_get_pdo_info(chip->pd_handle, chip->mmi_pdo_info,PD_MAX_PDO_NUM);
-		mmi_chrg_info(chip, "check all effective pdo info\n");
-		for (i = 0; i < PD_MAX_PDO_NUM; i++) {
-			if ((chip->mmi_pdo_info[i].type ==
-					PD_SRC_PDO_TYPE_AUGMENTED)
-				&& chip->mmi_pdo_info[i].uv_max >= PUMP_CHARGER_PPS_MIN_VOLT
-				&& chip->mmi_pdo_info[i].ua >= chip->typec_middle_current) {
-					chip->mmi_pd_pdo_idx = chip->mmi_pdo_info[i].pdo_pos;
-					mmi_chrg_info(chip,
-							"pd charger support pps, pdo %d, "
-							"volt %d, curr %d \n",
-							chip->mmi_pd_pdo_idx,
-							chip->mmi_pdo_info[i].uv_max,
-							chip->mmi_pdo_info[i].ua);
-					chip->pd_pps_support = true;
+	if(val.intval  == POWER_SUPPLY_TYPE_USB_HVDCP_3P5)
+		chip->qc3p_active = true;
+	else
+		chip->qc3p_active = false;
 
-					if (chip->mmi_pdo_info[i].uv_max <
-							chip->pd_volt_max) {
-						chip->pd_volt_max =
-						chip->mmi_pdo_info[i].uv_max;
-					}
-					if (chip->mmi_pdo_info[i].ua <
-							chip->pd_curr_max) {
-						chip->pd_curr_max =
-						chip->mmi_pdo_info[i].ua;
-					}
-				break;
-			}
-		}
+	ret = power_supply_get_property(chip->usb_psy,
+				POWER_SUPPLY_PROP_HVDCP_POWER, &val);
+	if (ret) {
+		mmi_chrg_err(chip, "Unable to read qc3p power: %d\n", ret);
+		goto schedule_work;
+	}
+
+	chip->qc3p_power = val.intval;
+	mmi_chrg_err(chip, "qc3p detected power:%d\n",chip->qc3p_power);
+
+	if (!chip->sm_work_running && chip->vbus_present
+		&& chip->qc3p_active) {
+		chip->pd_pps_support = true;
+		calculate_qc3p_vc_based_power_type(chip);
 
 		if (chip->pd_pps_support
 			&& !chip->factory_mode) {
@@ -1403,13 +1385,40 @@ schedule_work:
 			      msecs_to_jiffies(hb_resch_time));
 }
 
+void calculate_qc3p_vc_based_power_type(struct mmi_charger_manager *chip){
+	int volt_max,curr_max;
+
+	switch(chip->qc3p_power) {
+		case QC3P_POWER_18W:
+			volt_max = 9500000;
+			curr_max = 1900000;
+			break;
+		case QC3P_POWER_27W:
+			volt_max = 11000000;
+			curr_max = 3000000;
+			break;
+		case QC3P_POWER_45W:
+			volt_max = 15000000;
+			curr_max = 3000000;
+			break;
+		default:
+			volt_max = 5000000;
+			curr_max = 500000;
+			break;
+	}
+
+	chip->pd_volt_max = volt_max;
+	chip->pd_curr_max = curr_max;
+
+	mmi_chrg_info(chip, "calculate qc3p vc base power, volt_max:%d,curr_max:%d\n",chip->pd_volt_max, chip->pd_curr_max );
+}
+
 static void psy_changed_work_func(struct work_struct *work)
 {
 	struct mmi_charger_manager *chip = container_of(work,
 				struct mmi_charger_manager, psy_changed_work);
 	union power_supply_propval val;
-	bool pd_active;
-	int ret, i;
+	int ret;
 
 	mmi_chrg_info(chip, "kick psy changed work.\n");
 
@@ -1431,59 +1440,33 @@ static void psy_changed_work_func(struct work_struct *work)
 	chip->vbus_present = val.intval;
 
 	ret = power_supply_get_property(chip->usb_psy,
-				POWER_SUPPLY_PROP_PD_ACTIVE, &val);
+				POWER_SUPPLY_PROP_REAL_TYPE, &val);
 	if (ret) {
-		mmi_chrg_err(chip, "Unable to read PD ACTIVE: %d\n", ret);
+		mmi_chrg_err(chip, "Unable to read qc3p type or not the qc3p5 type return: %d\n", ret);
 		return;
 	}
-	pd_active = val.intval;
 
-	if (!chip->pd_handle) {
-		chip->pd_handle = devm_usbpd_get_by_phandle(chip->dev,
-						    "qcom,usbpd-phandle");
-		if (IS_ERR_OR_NULL(chip->pd_handle)) {
-			mmi_chrg_err(chip, "Error getting the pd phandle %ld\n",
-				PTR_ERR(chip->pd_handle));
-			chip->pd_handle = NULL;
-			return;
-		}
+	if(val.intval == POWER_SUPPLY_TYPE_USB_HVDCP_3P5 )
+		chip->qc3p_active = true;
+	else
+		chip->qc3p_active = false;
+
+	ret = power_supply_get_property(chip->usb_psy,
+				POWER_SUPPLY_PROP_HVDCP_POWER, &val);
+	if (ret) {
+		mmi_chrg_err(chip, "Unable to read qc3p power: %d\n", ret);
+		return;
 	}
 
-	if (pd_active && chip->vbus_present) {
-		usbpd_get_pdo_info(chip->pd_handle, chip->mmi_pdo_info,PD_MAX_PDO_NUM);
-		mmi_chrg_info(chip, "check all effective pdo info\n");
-		for (i = 0; i < PD_MAX_PDO_NUM; i++) {
-			if ((chip->mmi_pdo_info[i].type ==
-					PD_SRC_PDO_TYPE_AUGMENTED)
-				&& chip->mmi_pdo_info[i].uv_max >= PUMP_CHARGER_PPS_MIN_VOLT
-				&& chip->mmi_pdo_info[i].ua >= chip->typec_middle_current) {
-					chip->mmi_pd_pdo_idx = chip->mmi_pdo_info[i].pdo_pos;
-					mmi_chrg_info(chip,
-							"pd charger support pps, pdo %d, "
-							"volt %d, curr %d \n",
-							chip->mmi_pd_pdo_idx,
-							chip->mmi_pdo_info[i].uv_max,
-							chip->mmi_pdo_info[i].ua);
-					chip->pd_pps_support = true;
+	chip->qc3p_power = val.intval;
+	mmi_chrg_err(chip, "qc3p detected power:%d\n",chip->qc3p_power);
 
-					if (chip->mmi_pdo_info[i].uv_max <
-							chip->pd_volt_max) {
-						chip->pd_volt_max =
-						chip->mmi_pdo_info[i].uv_max;
-					}
-
-					if (chip->mmi_pdo_info[i].ua <
-							chip->pd_curr_max) {
-						chip->pd_curr_max =
-						chip->mmi_pdo_info[i].ua;
-					}
-
-				break;
-			}
-		}
+	if (chip->qc3p_active && chip->vbus_present) {
+		chip->pd_pps_support = true;
+		calculate_qc3p_vc_based_power_type(chip);
 	}
 
-	mmi_chrg_info(chip, "vbus present %d, pd pps support %d, "
+	mmi_chrg_info(chip, "vbus present %d, qc3p pps support %d, "
 					"pps max voltage %d, pps max curr %d\n",
 					chip->vbus_present,
 					chip->pd_pps_support,
@@ -1508,6 +1491,7 @@ static void psy_changed_work_func(struct work_struct *work)
 #define DEFAULT_PPS_CURR_STEPS	50000
 #define DEFAULT_PPS_VOLT_MAX	11000000
 #define DEFAULT_PPS_CURR_MAX	4000000
+#define DEFAULT_HVDCP_POWER_MAX	15000
 #define MMI_TEMP_ZONES	5
 static int mmi_chrg_manager_parse_dt(struct mmi_charger_manager *chip)
 {
@@ -1600,6 +1584,16 @@ static int mmi_chrg_manager_parse_dt(struct mmi_charger_manager *chip)
 		chip->pd_curr_max =
 				DEFAULT_PPS_CURR_MAX;
 	pd_curr_max_init = chip->pd_curr_max;
+
+	rc = of_property_read_u32(node,
+                                "mmi,hvdcp-power-max",
+                                &chip->hvdcp_power_max);
+	if (rc < 0)
+		chip->hvdcp_power_max =
+				DEFAULT_HVDCP_POWER_MAX;
+
+	chip->switch_charger_pps_volt = (chip->hvdcp_power_max /60) * 20000;
+	mmi_chrg_err(chip,"qc3p switch_charger_pps_volt:%d\n",chip->switch_charger_pps_volt);
 
 	for_each_child_of_node(node, child)
 		chip->mmi_chrg_dev_num++;
@@ -1782,10 +1776,11 @@ static int mmi_chrg_manager_parse_dt(struct mmi_charger_manager *chip)
 		}
 	}
 
-	chip->afvc_volt_comp = 0;
-	of_property_read_u32(node,
+	rc = of_property_read_u32(node,
 				"mmi,afvc_enable_compensation_uv",
 				&chip->afvc_volt_comp);
+	if (rc < 0)
+		chip->afvc_volt_comp = 0;
 	return rc;
 thermal_failed:
 	devm_kfree(chip->dev,chip->thermal_mitigation);
@@ -1795,6 +1790,12 @@ cleanup:
 	chip->mmi_chrg_dev_num = 0;
 	devm_kfree(chip->dev,chip->chrg_list);
 	return rc;
+}
+
+void init_qc3p_variable(struct mmi_charger_manager *chip)
+{
+	chip->qc3p_power = QC3P_POWER_NONE;
+	chip->qc3p_active = false;
 }
 
 static int mmi_chrg_manager_probe(struct platform_device *pdev)
@@ -1814,7 +1815,7 @@ static int mmi_chrg_manager_probe(struct platform_device *pdev)
 	}
 
 	chip->dev = &pdev->dev;
-	chip->name = "mmi_chrg_manager";
+	chip->name = "mmi_chrg_manager_qc3p";
 	chip->debug_mask = &__debug_mask;
 	chip->suspended = false;
 
@@ -1898,6 +1899,8 @@ static int mmi_chrg_manager_probe(struct platform_device *pdev)
 		chip->pd_handle = NULL;
 	}
 
+	init_qc3p_variable(chip);
+	
 	if (!chip->usb_psy) {
 		chip->usb_psy = power_supply_get_by_name("usb");
 		if (!chip->usb_psy)
@@ -1980,7 +1983,7 @@ static const struct dev_pm_ops mmi_dev_pm_ops = {
 };
 
 static const struct of_device_id mmi_chrg_manager_match_table[] = {
-	{.compatible = "mmi,chrg-manager"},
+	{.compatible = "mmi,chrg-manager_qc3p"},
 	{},
 };
 MODULE_DEVICE_TABLE(of, mmi_chrg_manager_match_table);
@@ -1989,7 +1992,7 @@ static struct platform_driver mmi_chrg_manager_driver = {
 	.probe = mmi_chrg_manager_probe,
 	.remove = mmi_chrg_manager_remove,
 	.driver = {
-		.name = "mmi_chrg_manager",
+		.name = "mmi_chrg_manager_qc3p",
 		.owner = THIS_MODULE,
 		.pm = &mmi_dev_pm_ops,
 		.of_match_table = mmi_chrg_manager_match_table,
