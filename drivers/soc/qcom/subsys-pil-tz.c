@@ -43,13 +43,6 @@ static char pil_ssr_reason[MAX_SSR_REASON_LEN];
 static char *ssr_reason = pil_ssr_reason;
 module_param(ssr_reason, charp, S_IRUGO);
 
-struct pil_map_fw_info {
-	void *region;
-	unsigned long attrs;
-	phys_addr_t base_addr;
-	struct device *dev;
-};
-
 /**
  * struct reg_info - regulator info
  * @reg: regulator handle

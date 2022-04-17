@@ -173,16 +173,6 @@ static const struct virtual_sensor_data qti_virtual_sensors[] = {
 		.coefficients = {30, 70},
 		.avg_denominator = 100,
 	},
-	{
-		.virt_zone_name = "penta-cpu-max-step",
-		.num_sensors = 5,
-		.sensor_names = {"apc1-cpu0-usr",
-				"apc1-cpu1-usr",
-				"apc1-cpu2-usr",
-				"apc1-cpu3-usr",
-				"cpuss-usr"},
-		.logic = VIRT_MAXIMUM,
-	},
 #ifdef CONFIG_QTI_VIRTUAL_SENSOR_MOTO_SMITH
 	{
 		.virt_zone_name = "front-usr",

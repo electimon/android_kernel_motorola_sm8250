@@ -365,7 +365,6 @@ struct dwc3_msm {
 	dma_addr_t		dummy_gsi_db_dma;
 	int			orientation_override;
 	bool			ext_typec_switch;
-	bool			usb_data_enabled;
 };
 
 #define USB_HSPHY_3P3_VOL_MIN		3050000 /* uV */

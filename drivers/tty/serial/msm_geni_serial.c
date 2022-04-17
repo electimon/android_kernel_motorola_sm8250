@@ -240,8 +240,6 @@ struct msm_geni_serial_port {
 	spinlock_t rx_lock;
 	bool bypass_flow_control;
 	enum uart_error_code uart_error;
-	struct work_struct work;
-	struct workqueue_struct *qwork;
 };
 
 static void msm_geni_serial_worker(struct work_struct *work);
@@ -634,8 +632,6 @@ static int msm_geni_serial_ioctl(struct uart_port *uport, unsigned int cmd,
 		IPC_LOG_MSG(port->ipc_log_misc,
 			"%s:TIOCFAULT - uart_error_set:%d new_uart_error:%d\n",
 			__func__, uart_error, port->uart_error);
-		if (port->qwork)
-			queue_work(port->qwork, &port->work);
 		ret = uart_error;
 		break;
 	}

@@ -1583,7 +1583,7 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 		f2fs_warn(sbi, "Start checkpoint disabled!");
 	}
 	if (cpc->reason != CP_RESIZE)
-		down_write(&sbi->cp_global_sem);
+		mutex_lock(&sbi->cp_mutex);
 #if defined(CONFIG_UFSTW)
 	bdev_set_turbo_write(sbi->sb->s_bdev);
 #endif
