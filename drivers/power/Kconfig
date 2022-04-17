@@ -6,3 +6,5 @@ source "drivers/power/qpnp_adaptive_charge/Kconfig"
 source "drivers/power/qpnp-smbcharger-mmi/Kconfig"
 source "drivers/power/mmi_parallel_charger/Kconfig"
 source "drivers/power/mmi_parallel_charger_qc3p/Kconfig"
+source "drivers/power/bq2597x_mmi/Kconfig"
+
