@@ -352,13 +352,13 @@ static int f2fs_write_meta_pages(struct address_space *mapping,
 		goto skip_write;
 
 	/* if locked failed, cp will flush dirty pages instead */
-	if (!down_write_trylock(&sbi->cp_global_sem))
+	if (!mutex_trylock(&sbi->cp_mutex))
 		goto skip_write;
 
 	trace_f2fs_writepages(mapping->host, wbc, META);
 	diff = nr_pages_to_write(sbi, META, wbc);
 	written = f2fs_sync_meta_pages(sbi, META, wbc->nr_to_write, FS_META_IO);
-	up_write(&sbi->cp_global_sem);
+	mutex_unlock(&sbi->cp_mutex);
 	wbc->nr_to_write = max((long)0, wbc->nr_to_write - written - diff);
 	return 0;
 
@@ -1659,7 +1659,7 @@ out:
 	bdev_clear_turbo_write(sbi->sb->s_bdev);
 #endif
 	if (cpc->reason != CP_RESIZE)
-		up_write(&sbi->cp_global_sem);
+		mutex_unlock(&sbi->cp_mutex);
 	return err;
 }
 
