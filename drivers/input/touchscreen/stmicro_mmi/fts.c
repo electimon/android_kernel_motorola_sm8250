@@ -123,11 +123,8 @@ static u8 key_mask = 0x00;	/* /< store the last update of the key mask
 #endif
 
 
-extern spinlock_t fts_int;
 
 
-
-static void fts_interrupt_enable(struct fts_ts_info *info);
 static int fts_mode_handler(struct fts_ts_info *info, int force);
 
 
@@ -150,10 +147,12 @@ void release_all_touches(struct fts_ts_info *info)
 #endif
 		input_mt_slot(info->input_dev, i);
 		input_mt_report_slot_state(info->input_dev, type, 0);
-		input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, -1);
+		/* input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, -1); */
 	}
+	input_report_key(info->input_dev, BTN_TOUCH, 0);
 	input_sync(info->input_dev);
 	info->touch_id = 0;
+	info->touch_count = 0;
 #ifdef STYLUS_MODE
 	info->stylus_id = 0;
 #endif
@@ -2154,7 +2153,11 @@ static void fts_enter_pointer_event_handler(struct fts_ts_info *info, unsigned
 
 	/* logError(0, "%s  %s : TouchID = %d,Touchcount = %d
 	 *\n",tag,__func__,touchId,touchcount); */
-	input_report_key(info->input_dev, BTN_TOUCH, touch_condition);
+	if (event[0] == EVT_ID_ENTER_POINT) {
+		if (info->touch_count == 0)
+			input_report_key(info->input_dev, BTN_TOUCH, touch_condition);
+		info->touch_count++;
+	}
 
 	/* input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, touchId); */
 	input_report_abs(info->input_dev, ABS_MT_POSITION_X, x);
@@ -2226,8 +2229,13 @@ static void fts_leave_pointer_event_handler(struct fts_ts_info *info, unsigned
 	/* logError(0, "%s  %s : TouchID = %d, Touchcount = %d\n",tag,__func__,
 	  *	touchId,touchcount); */
 
+	/* no need to set ABS_MT_TRACKING_ID, input_mt_init_slots() already set it */
+	/* input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, -1); */
+	if (info->touch_count > 0)
+		info->touch_count--;
 
-	input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, -1);
+	if (info->touch_count == 0)
+		input_report_key(info->input_dev, BTN_TOUCH, 0);
 	/* logError(0, "%s  %s : Event 0x%02x - release ID[%d]\n", tag,
 	 * __func__, event[0], touchId); */
 }
@@ -2579,7 +2587,7 @@ static void fts_key_event_handler(struct fts_ts_info *info, unsigned
 static void fts_gesture_event_handler(struct fts_ts_info *info, unsigned
 				      char *event)
 {
-	int value;
+	int value = 0;
 	int needCoords = 0;
 
 	logError(0,
@@ -2693,6 +2701,27 @@ static void fts_gesture_event_handler(struct fts_ts_info *info, unsigned
 			logError(0, "%s %s:  > !\n", tag, __func__);
 			break;
 
+		case GEST_ID_SIGTAP:
+#if defined(CONFIG_INPUT_TOUCHSCREEN_MMI)
+			if (info->imports && info->imports->report_gesture) {
+				int ret = 0;
+				struct gesture_event_data mmi_event;
+
+				logError(1, "%s %s: invoke imported report gesture function\n", tag, __func__);
+				/* extract X and Y coordinates */
+				mmi_event.evcode = 1;
+				mmi_event.evdata.x = (event[4] << 8) | event[3];
+				mmi_event.evdata.y = (event[6] << 8) | event[5];
+				/* call class method */
+				ret = info->imports->report_gesture(&mmi_event);
+				if (!ret)
+					PM_WAKEUP_EVENT(info->wakesrc, 3000);
+
+				goto gesture_done;
+			}
+#endif
+			break;
+
 		default:
 			logError(0, "%s %s:  No valid GestureID!\n", tag,
 				 __func__);
@@ -2758,9 +2787,9 @@ static void fts_user_report_event_handler(struct fts_ts_info *info, unsigned
   * the FIFO and dispatch them to the proper event handler according the event
   * ID
   */
-static void fts_event_handler(struct work_struct *work)
+static irqreturn_t fts_event_handler(int irq, void *ptr)
 {
-	struct fts_ts_info *info;
+	struct fts_ts_info *info = (struct fts_ts_info *)ptr;
 	int error = 0, count = 0;
 	unsigned char regAdd;
 	unsigned char data[FIFO_EVENT_SIZE] = { 0 };
@@ -2768,13 +2797,9 @@ static void fts_event_handler(struct work_struct *work)
 
 	event_dispatch_handler_t event_handler;
 
-	info = container_of(work, struct fts_ts_info, work);
-
 	PM_WAKEUP_EVENT(info->wakesrc, jiffies_to_msecs(HZ));
 
 	/* read the FIFO and parsing events */
-
-
 	regAdd = FIFO_CMD_READONE;
 
 	for (count = 0; count < FIFO_DEPTH; count++) {
@@ -2805,10 +2830,7 @@ static void fts_event_handler(struct work_struct *work)
 	}
 	input_sync(info->input_dev);
 
-
-	/* re-enable interrupts */
-
-	fts_interrupt_enable(info);
+	return IRQ_HANDLED;
 }
 /** @}*/
 
@@ -3044,29 +3066,6 @@ int fts_chip_initialization(struct fts_ts_info *info, int init_type)
 	return ret2;
 }
 
-
-/**
-  * @addtogroup isr
-  * @{
-  */
-/**
-  * Top half Interrupt handler function
-  * Respond to the interrupt and schedule the bottom half interrupt handler
-  * in its work queue
-  * @see fts_event_handler()
-  */
-static irqreturn_t fts_interrupt_handler(int irq, void *handle)
-{
-	struct fts_ts_info *info = handle;
-
-	disable_irq_nosync(info->client->irq);
-
-	queue_work(info->event_wq, &info->work);
-
-	return IRQ_HANDLED;
-}
-
-
 /**
   * Initialize the dispatch table with the event handlers for any possible event
   * ID
@@ -3097,12 +3096,10 @@ static int fts_interrupt_install(struct fts_ts_info *info)
 	install_handler(info, STATUS_UPDATE, status);
 	install_handler(info, USER_REPORT, user_report);
 
-	/* disable interrupts in any case */
-	error = fts_disableInterrupt();
-
-	if (request_irq(info->client->irq, fts_interrupt_handler,
-			IRQF_TRIGGER_LOW, FTS_TS_DRV_NAME, info)) {
-		logError(1, "%s Request irq failed\n", tag);
+	error = request_threaded_irq(info->client->irq, NULL, fts_event_handler,
+			 IRQF_TRIGGER_LOW|IRQF_ONESHOT, FTS_TS_DRV_NAME, info);
+	if (error < 0) {
+		logError(1, "%s Request threaded irq failed\n", tag);
 		kfree(info->event_dispatch_table);
 		error = -EBUSY;
 	}
@@ -3122,15 +3119,6 @@ void fts_interrupt_uninstall(struct fts_ts_info *info)
 	kfree(info->event_dispatch_table);
 
 	free_irq(info->client->irq, info);
-}
-
-/**
-  * Enable the host side interrupt
-  */
-static void fts_interrupt_enable(struct fts_ts_info *info)
-{
-	/* logError(0, "%s %s : enable interrupts!\n",tag,__func__); */
-	enable_irq(info->client->irq);
 }
 
 /**@}*/
@@ -3277,7 +3265,7 @@ int fts_chip_powercycle(struct fts_ts_info *info)
 	logError(1, "%s %s: Disabling IRQ...\n", tag, __func__);
 	/* if IRQ pin is short with DVDD a call to the ISR will triggered when
 	  * the regulator is turned off if IRQ not disabled */
-	fts_disableInterrupt();
+	fts_disableInterruptNoSync();
 
 	if (info->vdd_reg) {
 		error = regulator_disable(info->vdd_reg);
@@ -3530,6 +3518,10 @@ static int fts_mode_handler(struct fts_ts_info *info, int force)
 					 __func__);
 		}
 #endif
+
+		logError(1, "%s %s: Sense OFF!\n", tag, __func__);
+		res |= setScanMode(SCAN_MODE_ACTIVE, 0x00);
+
 		/* if some selective scan want to be enabled can be done an or
 		 * of the following options */
 		/* settings[0] = ACTIVE_MULTI_TOUCH | ACTIVE_KEY | ACTIVE_HOVER
@@ -3979,10 +3971,40 @@ static int parse_dt(struct device *dev, struct fts_hw_platform_data *bdata)
 		logError(0, "%s flip X\n", tag);
 	}
 
+	if (of_property_read_u8_array(np, "st,interpolation_cmd",
+			bdata->interpolation_cmd, 10) == 0) {
+		bdata->interpolation_ctrl = true;
+		logError(1, "%s Support report rate interpolation.\n", tag);
+	}
+
+	if (of_property_read_u8_array(np, "st,jitter_cmd",
+			bdata->jitter_cmd, 8) == 0) {
+		bdata->jitter_ctrl = true;
+		logError(1, "%s Support set jitter.\n", tag);
+	}
+
+	if (of_property_read_u8_array(np, "st,linearity_cmd",
+			bdata->linearity_cmd, 3) == 0) {
+		bdata->linearity_ctrl = true;
+		logError(1, "%s Support set linearity.\n", tag);
+	}
+
+	if (of_property_read_u8_array(np, "st,first_filter_cmd",
+			bdata->first_filter_cmd, 4) == 0) {
+		bdata->first_filter_ctrl = true;
+		logError(1, "%s Support set first_filter.\n", tag);
+	}
+
 	if (of_property_read_u8_array(np, "st,report_rate_cmd",
-			bdata->report_rate_cmd, 10) == 0) {
+			bdata->report_rate_cmd, 3) == 0) {
 		bdata->report_rate_ctrl = true;
-		logError(1, "%s Support set report rate.\n", tag);
+		logError(1, "%s Support report rate switching.\n", tag);
+	}
+
+	if (of_property_read_u8_array(np, "st,edge_cmd",
+			bdata->edge_cmd, 3) == 0) {
+		bdata->edge_ctrl = true;
+		logError(1, "%s Support edge switching.\n", tag);
 	}
 
 	return OK;
@@ -4196,8 +4218,6 @@ static int fts_probe(struct spi_device *client)
 		goto ProbeErrorExit_4;
 	}
 
-	INIT_WORK(&info->work, fts_event_handler);
-
 	INIT_WORK(&info->resume_work, fts_resume_work);
 	INIT_WORK(&info->suspend_work, fts_suspend_work);
 
@@ -4289,8 +4309,6 @@ static int fts_probe(struct spi_device *client)
 #ifdef GESTURE_MODE
 	mutex_init(&gestureMask_mutex);
 #endif
-
-	spin_lock_init(&fts_int);
 
 	/* register the multi-touch input device */
 	error = input_register_device(info->input_dev);
@@ -4532,6 +4550,9 @@ static void __exit fts_driver_exit(void)
 }
 
 
+#if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+#endif
 MODULE_DESCRIPTION("STMicroelectronics MultiTouch IC Driver");
 MODULE_AUTHOR("STMicroelectronics");
 MODULE_LICENSE("GPL");
